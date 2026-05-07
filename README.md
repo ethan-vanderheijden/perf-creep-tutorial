@@ -5,13 +5,13 @@ This interactive tutorial will walk you through setting up your testing environm
 ### Table of Contents
 
 <ol>
-    <li><a href="#building-mongodb-v7.0.0">Building MongoDB v7.0.0</a></li>
-    <li><a href="#setting-up-ycsb">Setting up YCSB</a></li>
+    <li><a href="#building-mongodb-v700">Building MongoDB v7.0.0</a></li>
+    <li><a href="#setting-up-ycsb-mongodb">Setting up YCSB / MongoDB</a></li>
     <li><a href="#setting-up-your-testing-environment">Setting up your testing environment</a></li>
     <li>
         <a href="#traditional-performance-analysis">Traditional Performance Analysis</a>
         <ul>
-        <li><a href="#benchmarking-tools">Benchmarking metrics</a></li>
+        <li><a href="#benchmark-metrics">Benchmark metrics</a></li>
         <li><a href="#flamegraphs">Flamegraphs</a></li>
         <li><a href="#function-latency-instrumentation">Function latency instrumentation</a></li>
         </ul>
@@ -95,7 +95,7 @@ Next, we have to monkey patch the source code to ensure it compiles without erro
 
 Finally, let's create a directory to store the final MongoDB binary. We will be building MongoDB twice, once for the buggy version and once for the patched version:
 ```bash
-mkdir install-mongo-bugggy
+mkdir install-mongo-buggy
 mkdir install-mongo-patched
 ```
 
@@ -114,7 +114,7 @@ python3 buildscripts/scons.py \
 > [!WARNING]  
 > Building MongoDB for the first time can take up to an hour!
 
-Next, we will apply the git patch fixing the regression and rebuild MongoDB. You can download the patch, called `mongo-regression.patch`, from this repository.
+Next, we will apply the git patch fixing the regression and rebuild MongoDB. You can download the patch ([resources/mongo-regression.patch](resources/mongo-regression.patch)) from this repository.
 ```bash
 git apply ../mongo-regression.patch
 
@@ -124,17 +124,39 @@ python3 buildscripts/scons.py \
    --disable-warnings-as-errors
 ```
 
-## Setting up YCSB
+## Setting up YCSB / MongoDB
 
-Now that we have our database built, we need a benchmarking tool to run queries against the database and measure its performance. We will be using [YCSB](https://github.com/brianfrankcooper/YCSB), which is a popular (but unmaintained) benchmarking tool for NoSQL databases. Different applications will need different benchmarking setups, so as always, you'll have to read through the documentation.
+Now that we have our database built, we need a benchmarking tool to run queries against the database and measure its performance. We will be using [go-ycsb](https://github.com/pingcap/go-ycsb), a fork of the popular YCSB written in Go, which is designed for benchmarking NoSQL databases. Different applications will need different benchmarking setups, so as always, you'll have to read through the documentation.
 
+Let's clone and build it:
+```bash
+cd $TUTORIAL_DIR
 
+git clone https://github.com/pingcap/go-ycsb.git
+cd go-ycsb
+make
+cd ..
+```
+
+Next, let's initialize the MongoDB database and load some test data. First, we'll create a data storage directory, and then, we'll start the MongoDB server using our configuration file. You can download the configuration file ([resources/mongo-config.yaml](resources/mongo-config.yaml)) from this repository.
+```bash
+mkdir mongo-data
+install-mongo-buggy/bin/mongod --dbpath mongo-data --config mongo-config.yaml
+```
+
+> [!TIP]  
+> When configuring your application, try to disable as much logging as possible! Logging means writing to disk, which can introduce performance noise as I/O performance is very variable.
+
+Now, download the YCSB workload file ([resources/ycsb-workload](resources/ycsb-workload)) from this repository and run the following command to load test data into MongoDB. This workload file creates 10,000,000 rows, which takes up ~12 GB. When running benchmarks, the entire database must be loaded into memory, so if your machine doesn't have this much memory, you can edit the workload file and reduce `recordcount`.
+```bash
+go-ycsb/bin/go-ycsb load mongodb -P resources/ycsb-workload --threads $(nproc)
+```
 
 ## Setting up your testing environment
 
 ## Traditional Performance Analysis
 
-### Benchmarking tools
+### Benchmark metrics
 
 ### Flamegraphs
 

@@ -1,0 +1,10 @@
+systemLog:
+  quiet: true
+net:
+  tls:
+    mode: disabled
+storage:
+  engine: wiredTiger
+  wiredTiger:
+    engineConfig:
+      cacheSizeGB: 20
