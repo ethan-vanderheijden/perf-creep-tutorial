@@ -154,6 +154,103 @@ go-ycsb/bin/go-ycsb load mongodb -P resources/ycsb-workload --threads $(nproc)
 
 ## Setting up your testing environment
 
+Before we start running benchmarks, it's important to set up a testing environment that controls for performance variation as much as possible.
+
+### Configuring boot parameters
+
+1. Disabling Intel P-states
+
+Modern CPUs have dynamic frequency scaling, which means they can run at high frequencies when extra performance is needed and run at slower frequencies to save power when the system is idle. However, this can introduce performance variation if the frequency fluctuates while benchmarking. The exact frequency is typically auto-magically determined by the CPU. Our ultimate goal is to lock the CPU at the highest frequency, so our first step is to disable hardware-managed frequency scaling:
+
+> Add the boot option `intel_pstate=disable` and reboot your machine.
+> 
+> To verify, run `cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_driver` and ensure it prints `acpi-cpufreq`.
+
+2. Disabling the Scheduler Tick
+
+The kernel programs a periodic timer interrupt, called the scheduler tick, to perform various housekeeping tasks, such as tracking the CPU time of a process, handling RCU callbacks, etc. If you are curious, you can check the exact scheduler tick frequency by reading `/proc/config.gz` (with `zless`) and searching for `CONFIG_HZ`, which is usually set to 1000 hz.
+
+Unfortunately, every time the scheduler tick fires, it context switches into the kernel, interrupting the application and trashing the L1/L2 cache. In modern kernels, we can disable the [scheduler tick](https://docs.kernel.org/timers/no_hz.html):
+
+> Add the boot option `nohz_full=X-Y`, where `X-Y` is the range of CPU cores that should be tickless (e.g., `nohz_full=1-13`), and reboot your machine.
+
+> [!IMPORTANT]
+> At the time of writing (with Linux v7.0), there is a kernel bug where tickless cores will enter very deep c-states whenever idle, which powers off the L1/L2 cache and severely degrades performance after it wakes up. I documented the bug [here](https://docs.google.com/document/d/1zwAjKgkpWc3fUe1_qqesdu5Z3KvY6PQBXmC4-XeiPN4/edit?tab=t.yfe18cnkn0qy). Long story short, we should disable every c-state except the most shallow one to sidestep this issue:
+>
+> Add the boot parameter `intel_idle.max_cstate=1` and reboot your machine.
+
+### Configuring runtime parameters
+
+> [!IMPORTANT]
+> These steps need to be performed every time you boot your machine, so I recommend creating a script to automate this.
+
+1. Disable simultaneous multithreading (SMT) 
+
+Simultaneous multithreading (which Intel calls Hyperthreading) is a technique where two or more instruction streams are multiplexed on a single physical core, producing multiple logical cores. However, these logical cores share many physical resources, such as L1/L2 cache and execution units. If you run your application on a hyperthread, and another application runs on its sibling hyperthread, your application might experience performance fluctuations as it contends with its sibling.
+
+The simplest solution is to disable SMT through Linux:
+```bash
+echo off > /sys/devices/system/cpu/smt/control
+```
+
+Alternatively, you can sometimes disable SMT through your machine's BIOS setting.
+
+1. Lock CPU frequency to the maximum
+
+```bash
+for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+  echo performance > $f
+done
+```
+
+The "performance" CPU governor will simply set the CPU frequency to the maximum and keep it there.
+
+3. Disabling turbo boost
+
+With dynamic overclocking (which Intel calls Turbo Boost), the CPU can temporarily raise its frequency above the normal maximum to boost performance. However, this causes wild spikes in our benchmarking performance, so let's disable it:
+```bash
+echo 1 > /sys/devices/system/cpu/intel_pstate/no_turbo
+```
+
+4. Isolating CPU cores with cgroups
+
+The last thing we want is for the scheduler to place other applications on the same CPU core as MongoDB/YCSB, which will cause performance variation as they compete for CPU time. We will use a Linux kernel feature called cgroups to isolate a set of CPU cores for MongoDB and a set for YCSB. I highly recommend reading the [cgroup documentation](https://docs.kernel.org/admin-guide/cgroup-v2.html). In a nutshell, you'll need to do something like this:
+
+```bash
+cd /sys/fs/cgroup
+
+# create a new cgroup called "testing_env"
+mkdir testing_env
+# we need to enable the "cpuset" controller for this cgroup (read the docs for details)
+echo +cpuset > testing_env/cgroup.subtree_control
+# configure the cgroup to reserve exclusive access to CPU cores 1-13
+echo root > testing_env/cpuset.cpus.partition
+echo 1-13 > testing_env/cpuset.cpus.exclusive
+
+cd testing_env
+
+# reserve CPU cores 6-13 for the "mongo" cgroup
+mkdir mongo
+echo root > mongo/cpuset.cpus.partition
+echo 6-13 > mongo/cpuset.cpus.exclusive
+
+# reserve CPU cores 1-5 for the "ycsb" cgroup
+mkdir ycsb
+echo root > ycsb/cpuset.cpus.partition
+echo 1-5 > ycsb/cpuset.cpus.exclusive
+```
+
+> [!IMPORTANT]
+> On my computer, CPU cores 0-5 are P-cores and 6-13 are E-cores. The exact configuration is unimportant, but if you are reserving a range of cores, make sure that those cores are homogenous (e.g., don't mixing P-cores and E-cores in the same cgroup).
+
+> [!TIP]
+> When you want to start benchmarking, create two terminals and add their PIDs to the corresponding cgroups:
+> ```bash
+> echo <TERM1_PID> > testing_env/mongo/cgroup.procs
+> echo <TERM2_PID> > testing_env/ycsb/cgroup.procs
+> ```
+> That way, any process launched from those terminals, like MongoDB / YCSB, is automatically added to the corresponding cgroup.
+
 ## Traditional Performance Analysis
 
 ### Benchmark metrics
