@@ -253,7 +253,64 @@ echo 1-5 > ycsb/cpuset.cpus.exclusive
 
 ## Traditional Performance Analysis
 
+Now we are ready to run benchmarks! So create two new terminals and assign them to the cgroups we created earlier.
+
+Start MongoDB in one terminal:
+```bash
+cd $TUTORIAL_DIR
+
+install-mongo-buggy/bin/mongod --dbpath mongo-data --config mongo-config.yaml
+```
+
+When benchmarking databases, it's important to load the entire database into memory before we try to measure performance. We'll do that by abusing the `mongodump` tool, which is designed for backing up databases:
+```bash
+# mongodump will copy the database into mongo-dump-temp, inadvertently loading it into the server's memory
+mongodump --out mongo-dump-temp
+
+# this may take a while...
+
+rm -rf mongo-dump-temp
+```
+
+Now, let's do a warmup run of YCSB in the other terminal:
+```bash
+go-ycsb/bin/go-ycsb run mongodb -P ycsb-workload --interval 5
+```
+
+YCSB will print out metrics every 5 seconds. Let YCSB run until the metrics stabilize. In the beginning, you'll find that the reported "Avg latency" steadily decreases, but eventually, it should bottom out, though it may take a few minutes.
+
+Now, lets run the actual benchmark and record the latency of every query. We will run 15,000 queries at a rate of 100 queries/second, which takes 2.5 minutes to run. The exact configuration is unimportant, but make sure you use the same configuration every time.
+```bash
+mkdir results
+
+go-ycsb/bin/go-ycsb run mongodb -P ycsb-workload --target 100 -p operationcount=15000 -p measurementtype=csv -p measurement.output_file=results/buggy.csv
+```
+
+You'll need to repeat this warmup process every time you run a benchmark— it's tedious but necessary.
+
+Now, repeat this process with the patched version of MongoDB (`install-mongo-patched/bin/mongod`). Ultimately, you should have two files: `results/buggy.csv` and `results/patched.csv`.
+
 ### Benchmark metrics
+
+The first step on our journey is to analyze the metrics reported by YCSB. I did this basic data analysis in a Python Notebook, which you can find in this repository ([resources/benchmark-analysis.ipynb](resources/bench-analysis.ipynb)). The question we are trying to answer is: can we detect the performance regression with simple, high-level metrics?
+
+Let's plot a timeseries of query latency over the 2.5 minute benchmark run. Here's what I got for latency over time of the patched MongoDB. To make the graph easier to read, every 20 queries were averaged together and represented as a single data point.
+
+![Latency over time for patched MongoDB](_imgs/latency-patched.png)
+
+There is clearly a downwards trend over the first ~20 seconds. This is very bad— ideally, benchmark samples should be independent and demonstrate no auto-correlation. However, despite our best efforts to warm up the database, it seems like it still had some warming up to do. To stay on the safe side, we can discard the first 60% of data:
+
+![Latency over time for patched MongoDB after discarding the first 60% of data](_imgs/latency-patched-discardtail.png)
+
+This looks much better! It looks nearly constant.
+
+Now, let's compute the median latency of the buggy and patched MongoDB after discarding the first 60% of data. For the data I collected, buggy MongoDB acheives a latency of `716 µs`, while patched MongoDB acheives a latency of `704 µs`. This suggests the regression causes a `12 µs` latency increase, or a `~1.7%` regression.
+
+Last but not least, let's plot a histogram of query latency for both versions:
+
+![Latency histogram for both versions of MongoDB](_imgs/latency-histogram.png)
+
+There is clearly some visual separation between these distributions, which is further evidence that the regression is real. But is this difference statistically significant? In theory, you can perform a statistical test to confirm it.
 
 ### Flamegraphs
 
