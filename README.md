@@ -241,7 +241,7 @@ echo 1-5 > ycsb/cpuset.cpus.exclusive
 ```
 
 > [!IMPORTANT]
-> On my computer, CPU cores 0-5 are P-cores and 6-13 are E-cores. The exact configuration is unimportant, but if you are reserving a range of cores, make sure that those cores are homogenous (e.g., don't mixing P-cores and E-cores in the same cgroup).
+> On my computer, CPU cores 0-5 are P-cores and 6-13 are E-cores. The exact configuration is unimportant, but if you are reserving a range of cores, make sure that those cores are homogenous (e.g., don't mix P-cores and E-cores in the same cgroup).
 
 > [!TIP]
 > When you want to start benchmarking, create two terminals and add their PIDs to the corresponding cgroups:
@@ -313,6 +313,60 @@ Last but not least, let's plot a histogram of query latency for both versions:
 There is clearly some visual separation between these distributions, which is further evidence that the regression is real. But is this difference statistically significant? In theory, you can perform a statistical test to confirm it.
 
 ### Flamegraphs
+
+Now that we are somewhat confident that the regression does, in fact, exist, the question becomes: what is the root cause of the regression?
+
+When analyzing performance regressions, one of the most common techniques is to collect a Flamegraph. The flamegraph was invented by Brendan Gregg, one of the heavy-weights in the field of performance analysis, and has been used to great effect by countless engineers. I highly recommend reading his [article on flamegraphs](https://www.brendangregg.com/FlameGraphs/cpuflamegraphs.html).
+
+In a nutshell, the program is interrupted at a fixed frequency and traps to the kernel. The kernel records the current call stack, which is read via the Last Branch Record (LBR) hardware feature or by walking the stack, and each call stack is one "sample". By collecting a large number of samples, we get a statistical picture of where the CPU is spending its time (e.g., 60% of samples are `f1() -> f2() -> g1()`, 30% of the samples are `f1() -> f2() -> z1()`, etc.), which we can turn into a fancy flamegraph visualization.
+
+Run the benchmark again, ***after the proper warmup routine***:
+```bash
+go-ycsb/bin/go-ycsb run mongodb -P ycsb-workload
+```
+
+Now, we need to find the thread ID (TID) of the MongoDB server thread that is actively executing the queries. The first step is to find the PID of MongoDB:
+```bash
+pgrep mongod
+```
+
+Then, we can print out all the threads of MongoDB and their CPU usage. The thread with the highest CPU usage is certainly the one executing the queries:
+```bash
+ps -T -p <MONGODB_PID> -o tid,pid,%cpu,cmd
+# manually find the TID with the highest CPU usage
+```
+
+Finally, we can sample the program at 497 Hz for 60 seconds using `perf`. The exact frequency and duration are unimportant, but more samples means higher quality data, though it can also mean more overhead and/or longer analysis time.
+```bash
+# data is stored to "perf.data"
+perf record -F 497 -p <MONGODB_PID> -g -- sleep 60
+```
+
+In the past, you needed a [special FlameGraph library](https://github.com/brendangregg/flamegraph), but modern `perf` has a flamegraph visualization built in:
+```bash 
+# flamegraph is stored to "flamegraph.html"
+perf script report flamegraph
+
+mv flamegraph.html results/buggy-flamegraph.html
+```
+
+Do the same thing for the patched version of MongoDB, and store the result as `results/patched-flamegraph.html`.
+
+You can open these files in your browser. It may look daunting at first, but you can click on a function to zoom in. Try clicing on `runCommandInvocation`, which is where the main body of work happens.
+
+The regression we are investigating happens within `parseSubFields`. You can find this function using the search bar in the top left and then clicking to zoom in. You should see that buggy version has additional stack frames for `wrap` and `BSONObjBuilder` that are not present in the patched version. This is evidence that our patch successfully removed the extraneous object copy!
+
+Flamegraphs are great for investigating large, obvious performance regressions that can be localized to one function, but they suffer from a host of problems when you apply them to tiny regressions like ours:
+
+1. The overhead of sampling may affect application behavior.
+
+Every time a sample is collected, the CPU traps to the kernel which records the call stack, potentially unwinding the stack in the process. This inevitably trashes the L1/L2 cache, which can change the performance characteristics of the application once it resumes. This is a form of observer bias— the act of measuring our programs changes what we are trying to measure. Worst of all, we have no way to quantifying this bias: it may be negligible for some applications, but for others with strong cache affinity, it may be detrimental.
+
+2. It's a statistical method, so there is inherent sampling noise.
+
+In my flamegraph, almost 20,000 samples were collected in total, but less than 100 of them landed in `parseSubFields`. That's less than 0.5%! I can see that `wrap` and `BSONObjBuilder` are not present in the patched version's flamegraph, but can I conclude that they are truly gone? Or perhaps, they are still being called but were unlucky enough to not be sampled? Likewise, in the buggy version's flamegraph, ~12% of the samples for `parseSubFields` were inside `wrap`. Can I conclude that `wrap` accounts for 12% of the execution time of `parseSubFields`? After all, we are talking about only a dozen samples, which is too small to draw conclusions from.
+
+Ultimately, these are gripes with the size of the sampled data set. We could always increase the sampling frequency, but that would exacerbate problem #1. We could also increase the sampling duration from minutes to hours, but obviously, no engineer wants to wait hours to collect data for a single flamegraph.
 
 ### Function latency instrumentation
 
