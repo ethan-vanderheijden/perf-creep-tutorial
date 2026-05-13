@@ -370,6 +370,61 @@ Ultimately, these are gripes with the size of the sampled data set. We could alw
 
 ### Function latency instrumentation
 
+By analyzing the benchmark metrics, we were able to create a latecy histogram for the entire query. By analyzing the flamegraph, we could get a rough idea of which functions the CPU was spending time in, but it's statistical sampling so the numbers aren't perfect.
+
+What if we could get a latency histogram for an individual function?
+
+There are a few ways to do this, which can be grouped into two categories: re-compiling the binary and dynamic instrumentation. Re-compilation involves modifying the source code; at its simplest, you can record the timestamp at the beginning and end of the function and compute the latency. A good example of this is [tracy](https://github.com/wolfpld/tracy). However, every time you want to analyze a different function, you need to recompile the binary, which is prohibitively time-consuming and why we won't be using this method today.
+
+Dynamic instrumentation is when you locate the function in a running binary and patch it to jump to your instrumentation code. Patching typically involves replacing the first few instructions in the function with a jump/trap instruction, which executes your instrumentation code before jumping back. The implementation is quite tricky, but we will use Linux's `uprobes`. You can read the [implementation details of `kprobes`](https://docs.kernel.org/trace/kprobes.html), which is the same idea as `uprobes` but for kernel space functions.
+
+In modern Linux, the easiest way to register and use `uprobes` is with eBPF. `bpftrace` is a great tool for this, but I also wrote a tool called [`granular-perf`](https://github.com/ethan-vanderheijden/granular-perf) that lets you collect histograms of latency as well as histograms of other PMU metrics, like cache misses.
+
+Let's clone `granular-perf` and build it:
+```bash
+git clone https://github.com/ethan-vanderheijden/granular-perf.git
+
+cd granular-perf
+make
+cd ..
+```
+
+Next, run the benchmark again, ***after the proper warmup routine***, and record the PID of MongoDB and the TID of the thread executing the queries.
+
+The next step is to find the function symbol that we want to analyze. Let's analyze `runCommandInvocation`. Looking closely at the flamegraph, we see that the function signature we are interested in is something like `mongo::CommandHelpers::runCommandInvocation(shared_ptr<RequestExecutionContext> rec, shared_ptr<CommandInvocation> invocation)`. We can search through the symbols in the MongoDB binary for a matching name:
+```bash
+readelf --wide --syms install-mongo-buggy/bin/mongod | grep CommandHelpers | grep runCommandInvocation | grep shared_ptr | grep RequestExecutionContext | grep CommandInvocation | grep -v Async
+```
+
+*Note: `grep -v Async` is necessary because MongoDB's source code contains both `runCommandInvocation` and `runCommandInvocationAsync`, but we are not interested in the async version.*
+
+We are given a single symbol, which for me is:
+```
+_ZN5mongo14CommandHelpers20runCommandInvocationESt10shared_ptrINS_23RequestExecutionContextEES1_INS_17CommandInvocationEEb
+```
+
+Finally, while the benchmark is running, we can use `granular-perf` to collect a latency histogram for the `runCommandInvocation` function:
+```bash
+# "-c 15": collect latencies for 15 seconds
+# "latency,318-384-3,constrained_avg": collect the latency metric in a histogram range of 318-384 with a bucket size of 3
+sudo granular_perf/build/granular_perf -t <MONGO_TID> -c 15 -e latency,318-384-3,constrained_avg <MONGO_PID> '*CommandHelpers20runCommandInvocationESt10shared_ptr*'
+```
+
+The output will be an ASCII histogram. If you want a graphical version that can be saved as an image, you can pipe the output to `draw_histogram.py`:
+```bash
+sudo granular_perf/build/granular_perf -t <MONGO_TID> -c 15 -e latency,318-384-3,constrained_avg <MONGO_PID> '*CommandHelpers20runCommandInvocationESt10shared_ptr*' | granular_perf/draw_histogram.py
+```
+
+Finally, save this histogram somewhere and then repeat the process for the patched. When I did this, I got the following latency histogram for the buggy version of MongoDB:
+![Latency histogram for runCommandInvocation in buggy MongoDB](_imgs/buggy-runcommand-latency.svg)
+
+And the following latency histogram for the patched version of MongoDB:
+![Latency histogram for runCommandInvocation in patched MongoDB](_imgs/patched-runcommand-latency.svg)
+
+This is very interesting because the latency distribution appears to be bimodal! Even more interesting, the smaller mode has not changed at all, indicating the regression does not affect that subset of queries. On the other hand, the larger mode has clearly shifted to the right by ~5 µs, roughly a 1.3% regression.
+
+Perhaps, some queries are reading data not in the cache, resulting in a high latency as the cache is filled, while other queries are reading hot data, which has low latency. Perhaps, the regression causes cache contention that disproportionately affects the queries that reading cold data. This is just speculation, but regardless, this gives us some new insight into the nature of the regression.
+
 ## pt-fuser Workflow
 
 ### Collecting, filtering, and merging traces
