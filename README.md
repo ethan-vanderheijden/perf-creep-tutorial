@@ -277,7 +277,7 @@ Now, let's do a warmup run of YCSB in the other terminal:
 go-ycsb/bin/go-ycsb run mongodb -P ycsb-workload --interval 5
 ```
 
-YCSB will print out metrics every 5 seconds. Let YCSB run until the metrics stabilize. In the beginning, you'll find that the reported "Avg latency" steadily decreases, but eventually, it should bottom out, though it may take a few minutes.
+YCSB will print out metrics every 5 seconds. Let YCSB run until the metrics stabilize. In the beginning, you'll find that the reported "average latency" steadily decreases, but eventually, it should bottom out, though it may take a few minutes.
 
 Now, lets run the actual benchmark and record the latency of every query. We will run 15,000 queries at a rate of 100 queries/second, which takes 2.5 minutes to run. The exact configuration is unimportant, but make sure you use the same configuration every time.
 ```bash
@@ -427,8 +427,86 @@ Perhaps, some queries are reading data not in the cache, resulting in a high lat
 
 ## pt-fuser Workflow
 
-### Collecting, filtering, and merging traces
+So far, we have seen that we can detect tiny performance regressions as long as we have a proper testing environment. We have also tried two tools to analyze the root cause of these regressions: flamegraphs and function latency instrumentation. Flamegraphs are easy to create but have high overhead and rely on statistical sampling. Function latency instrumentation does not suffer from sampling noise because it instruments every function execution, but consequently, it has even higher overhead. Furthermore, neither of these tools help us automatically pinpoint the root cause— for function latency instrumentation, we needed some idea of what function contained the regression before we could even use it.
 
-### Visualizing and comparing traces
+Let's try an alternative approach with [`pt-fuser`](https://github.com/ethan-vanderheijden/pt-fuser), which is based on Intel PT. Intel PT is a hardware feature that lets us record every branch taken by the CPU with very low overhead, letting us reconstruct the exact execution path with fine-grained timestamps. I highly recommend reading the [`perf` docs on using Intel PT](https://man7.org/linux/man-pages/man1/perf-intel-pt.1.html).
+
+First things first, let's clone and build `pt-fuser`:
+```bash
+cd $TUTORIAL_DIR
+
+git clone https://github.com/ethan-vanderheijden/pt-fuser.git
+
+cd pt-fuser
+cargo build --release
+cd ..
+```
+
+### Collecting and filtering traces
+
+Run the mongodb benchmark again, ***after the proper warmup routine***, but make sure you run the benchmark at a very low query rate. If Intel PT produces too much data and saturates the available memory bandwidth, it will back off, stop recording, and produce an "overflow" error, which can ruin the entire trace. Running the benchmark at a low query rate reduces contention for memory bandwidth, and thus, the chance that Intel PT throws an overflow error. For example, you can run the benchmark at 10 queries/second:
+```bash
+go-ycsb/bin/go-ycsb run mongodb -P ycsb-workload --target 10
+```
+
+
+Then, use `perf` to collect an Intel PT trace for 30 seconds:
+```bash
+sudo timeout 30 perf record -e intel_pt/cyc=1,mtc_period=0,noretcomp=1/u -t <MONGO_TID> -o results/buggy-intel-pt.data
+```
+
+On my machine, a 30 second trace produces roughly 50Mb of data. Play around with the timeout until you also get a trace of a similar magnitude.
+
+Then, run the benchmark again against the patched version of MongoDB and collect another Intel PT trace, storing it as `results/patched-intel-pt.data`.
+
+> [!IMPORTANT]
+> The exact configuration of Intel PT determines what granularity of timing information you record. Higher granularity is obviously better but also produces more data, which increases the chance of an "overflow" error. After collecting a trace, you should always check how many errors it contains:
+>
+> ```bash
+> perf script --itrace=e -i </path/to/trace.data>
+> ```
+>
+> At the end, it will say something like "153 instruction trace errors". The trace I collected spanned around 300 queries, so this is a rate of ~0.5 errors/query, which is manageable. If you are seeing to many errors, try playing around with the Intel PT configuration. Read the aforementioned docs or [this blog](https://halobates.de/blog/p/432) for information on the configuration parameters.
+>
+> `cyc=1` is essential. In my experience, `noretcomp=1` is also essential, and traces without it have inaccurate timing information.
+
+Once we have our Intel PT trace in `perf`'s data format, the next step is to convert it to `pt-fuser`'s data format:
+```bash
+# convert traces of the buggy version of MongoDB
+perf --no-pager script -i results/buggy-intel-pt.data --itrace=bei0ns --dlfilter=pt-fuser/target/release/libtransform_trace.so --dlarg=".*mongo::transport::SessionWorkflow::Impl::_dispatchWork.*" --dlarg=results/buggy-traces
+
+# convert traces of the patched version of MongoDB
+perf --no-pager script -i results/patched-intel-pt.data --itrace=bei0ns --dlfilter=pt-fuser/target/release/libtransform_trace.so --dlarg=".*mongo::transport::SessionWorkflow::Impl::_dispatchWork.*" --dlarg=results/patched-traces
+```
+
+For the Intel PT trace I collected, this produces about 300 traces for each version of MongoDB.
+
+Finally, not all of the trace we produced are equally useful. Some of the traces will have many "overflow" errors, and others may represent queries whose latencies were extreme outliers and should not be analyzed. Let's start by creating a histogram of errors across our traces for buggy MongoDB:
+```bash
+pt-fuser/target/release/histogram --gzip error results/buggy-traces/*
+```
+
+For my dataset, I had ~170 traces with no errors whatsoever, which is more than enough. So going forward, I'll use the filter `errors_max=0`.
+
+Next, let's create a histogram of query latency across our traces for buggy MongoDB:
+```bash
+pt-fuser/target/release/histogram --gzip latency results/buggy-traces/* --filter <BUGGY_FILTER>
+```
+
+For my dataset, the latency histogram was already looking mostly normal, so I didn't need to filter out any outliers. Thus, my final filter was `errors_max=0`.
+
+Repeat the same process to create a filter for the traces of patched MongoDB. For my dataset, I once again ended up with `errors_max=0`.
+
+### Visualizing, merging, and comparing traces
+
+After filtering, I was left with ~150 traces for both versions of MongoDB. You can manually inspect each trace... but that would take forever. Instead, we will merge them into a single trace for each version and then visualize those merged traces with [Perfetto](https://perfetto.dev/).
+
+```bash
+# merge traces of buggy MongoDB
+pt-fuser/target/release/merge --gzip --filter <BUGGY_FILTER> results/buggy-traces/merged.bin results/buggy-traces/*
+
+# merge traces of patched MongoDB
+pt-fuser/target/release/merge --gzip --filter <PATCHED_FILTER> results/patched-traces/merged.bin results/patched-traces/*
+```
 
 ## Takeaways
