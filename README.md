@@ -483,23 +483,30 @@ For the Intel PT trace I collected, this produces about 300 traces for each vers
 
 Finally, not all of the trace we produced are equally useful. Some of the traces will have many "overflow" errors, and others may represent queries whose latencies were extreme outliers and should not be analyzed. Let's start by creating a histogram of errors across our traces for buggy MongoDB:
 ```bash
-pt-fuser/target/release/histogram --gzip error results/buggy-traces/*
+pt-fuser/target/release/histogram --gzip errors results/buggy-traces/*
 ```
 
-For my dataset, I had ~170 traces with no errors whatsoever, which is more than enough. So going forward, I'll use the filter `errors_max=0`.
+For my dataset, I had ~170 traces with no errors whatsoever, which is more than enough. So going forward, I'll use the filter `max_errors=0`.
 
 Next, let's create a histogram of query latency across our traces for buggy MongoDB:
 ```bash
 pt-fuser/target/release/histogram --gzip latency results/buggy-traces/* --filter <BUGGY_FILTER>
 ```
 
-For my dataset, the latency histogram was already looking mostly normal, so I didn't need to filter out any outliers. Thus, my final filter was `errors_max=0`.
+For my dataset, the latency histogram was already looking mostly normal, so I didn't need to filter out any outliers.
 
-Repeat the same process to create a filter for the traces of patched MongoDB. For my dataset, I once again ended up with `errors_max=0`.
+Lastly, let's create a histogram of asynchronous interrupts, which signify that the application was paused while the CPU serviced some interrupt:
+```bash
+pt-fuser/target/release/histogram --gzip interrupts results/buggy-traces/* --filter <BUGGY_FILTER>
+```
+
+For my dataset, I had a further ~140 traces with no asynchronous interrupts, which is also more than enough. Therefore, my final filter was `max_errors=0,max_interrupts=0`.
+
+Repeat the same process to create a filter for the traces of patched MongoDB. For my dataset, I once again ended up with `max_errors=0,max_interrupts=0`.
 
 ### Visualizing, merging, and comparing traces
 
-After filtering, I was left with ~150 traces for both versions of MongoDB. You can manually inspect each trace... but that would take forever. Instead, we will merge them into a single trace for each version and then visualize those merged traces with [Perfetto](https://perfetto.dev/).
+After filtering, I was left with ~140 traces for both versions of MongoDB. You can manually inspect each trace... but that would take forever. Instead, we will merge them into a single trace for each version and then visualize those merged traces with [Perfetto](https://perfetto.dev/).
 
 ```bash
 # merge traces of buggy MongoDB
@@ -507,6 +514,15 @@ pt-fuser/target/release/merge --gzip --filter <BUGGY_FILTER> results/buggy-trace
 
 # merge traces of patched MongoDB
 pt-fuser/target/release/merge --gzip --filter <PATCHED_FILTER> results/patched-traces/merged.bin results/patched-traces/*
+```
+
+Now, we convert the merged trace into Perfetto's trace format and open it at https://ui.perfetto.dev/:
+```bash
+# convert the merged trace of buggy MongoDB
+pt-fuser/target/release/convert_perfetto --gzip results/buggy-traces/merged.bin results/buggy-trace.pftrace
+
+# convert the merged trace of patched MongoDB
+pt-fuser/target/release/convert_perfetto --gzip results/patched-traces/merged.bin results/patched-trace.pftrace
 ```
 
 ## Takeaways
