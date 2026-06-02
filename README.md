@@ -19,8 +19,8 @@ This interactive tutorial will walk you through setting up your testing environm
     <li>
         <a href="#pt-fuser-workflow">pt-fuser Workflow</a>
         <ul>
-        <li><a href="#collecting-filtering-and-merging-traces">Collecting, filtering, and merging traces</a></li>
-        <li><a href="#visualizing-and-comparing-traces">Visualizing traces and performing a manual comparison</a></li>
+        <li><a href="#collecting-and-filtering-traces">Collecting, filtering, and merging traces</a></li>
+        <li><a href="#visualizing-merging-and-comparing-traces">Visualizing traces and performing a manual comparison</a></li>
         </ul>
     </li>
     <li><a href="#takeaways">Takeaways</a></li>
@@ -525,4 +525,16 @@ pt-fuser/target/release/convert_perfetto --gzip results/buggy-traces/merged.bin 
 pt-fuser/target/release/convert_perfetto --gzip results/patched-traces/merged.bin results/patched-trace.pftrace
 ```
 
+The trace represents a single execution of the `mongo::transport::SessionWorkflow::Impl::_dispatchWork()` function, which appears as the top level frame. The callstack grows downwards, so each frame below it represents the execution of a subroutine. Additionally, `pt-fuser` supports discontinuous traces, so gaps in the trace represent periods when the application was not executing on the CPU (e.g., the kernel was servicing an interrupt, a system call trapped to the kernel, a page fault occured, etc.). In fact, by looking at these gaps, you can use `pt-fuser` to analyze time spent waiting for locks or performing syscalls. Lastly, the trace may have several other tracks signifying events of interest. For instance, the track called "Trace Errors" shows moments where the Intel PT trace was corrupted due to overflow errors, and the track called "Interrupts" shows moments when the trace was paused while the CPU serviced an asynchronous interrupt (as opposed to synchronous interrupts like syscalls and page faults).
+
+First, identity the frame for `FindCmd::Invocation::run()`, which is where the actual query execution happens. For my traces, the buggy version of MongoDB shows that this function takes 404.9 µs, while the patched version of MongoDB shows it taking 393.0 µs. That indicates a regression of ~12 µs, exactly what the benchmark metrics said!
+
+Now, zoom into the function `CanonicalQuery::canonicalize()`, and under it, you should locate the function `parseSubField()`, which is where the regression occured. By manually comparing the buggy and patched traces, you should find that the buggy trace has several additional functions no present in the patched trace, including `BSONObjBuilder()`, `wrap()`, and `intrusive_ptr_release()`. These are the functions responsible for the extraneous object copy. Interestingly, the total time spent in these functions is only ~1 µs, and the remaining ~11 µs of the regression is spread throughout the rest of the trace. There can be multiple reasons for this: perhaps, these functions polluted the CPU cache, which caused downstream functions to run slower. Or perhaps, these functions retrained the branch predictor/prefetcher, which caused more mispredicted branches/cache misses in downstream functions. This is just speculation, of course, but it illustrates that looking that latency is not enough to diagnose regressions. Often, some functions will appear to run slower even though they haven't changed at all.
+
 ## Takeaways
+
+Tiny performance regressions, like the one we investigated in this tutorial, can be diagnosed by looking at high-level benchmark metrics, as long as you have a properly configured testing environment. However, traditional tools for diagnosing the root cause, such as flamegraphs and function instrumentation, are not effective.
+
+Intel PT produces fine-grained traces with very little overhead, making it a promising tool for diagnosing tiny regressions. As it stands, `pt-fuser` is a decent platform for collecting, merging, and visualizing Intel PT traces, but comparing two traces still requires manual effort. Our ultimate goal is to develop a set of heuristics that can compare two traces and automatically pinpoint regressions.
+
+The main challenge is that tiny regressions (i.e., on the order of microseconds) can't be identified solely by looking at latency— sometimes, functions will slow down by microseconds even though they haven't changed at all. Any decent heuristic will have to take into account other kinds of information, such as the number of child functions, number of instructions executed, latency increase as a proportion of original latency, etc.
