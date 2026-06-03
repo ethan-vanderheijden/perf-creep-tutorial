@@ -6,7 +6,7 @@ This interactive tutorial will walk you through setting up your testing environm
 
 <ol>
     <li><a href="#building-mongodb-v700">Building MongoDB v7.0.0</a></li>
-    <li><a href="#setting-up-ycsb-mongodb">Setting up YCSB / MongoDB</a></li>
+    <li><a href="#setting-up-ycsb--mongodb">Setting up YCSB / MongoDB</a></li>
     <li><a href="#setting-up-your-testing-environment">Setting up your testing environment</a></li>
     <li>
         <a href="#traditional-performance-analysis">Traditional Performance Analysis</a>
